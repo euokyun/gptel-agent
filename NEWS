@@ -4,6 +4,29 @@
 
 ** New features and UI changes
 
+- The ~TodoWrite~ task list is no longer lost between turns.  Since the
+  tool is marked ~:include nil~ (it would otherwise add a tool block to
+  the transcript on every call), the model used to have no way of
+  knowing the current task list once a new message was sent: the overlay
+  would keep showing a frozen state while the model worked blind.
+
+  The live list is now appended to the end of every outgoing request by
+  a ~gptel-prompt-transform-functions~ handler
+  (~gptel-agent--inject-todos~), the same mechanism gptel uses for
+  context.  It never touches your buffer or the transcript, and since it
+  is appended after the conversation it does not invalidate the cached
+  prompt prefix.
+
+  Injection is conditional on the ~TodoWrite~ tool being enabled for the
+  request, so it costs nothing for agents that don't use it.  Two new
+  options control it:
+  - ~gptel-agent-todos-stale-after~ (default 3): after this many
+    requests without a ~TodoWrite~ call, the injected list is marked
+    ~STALE~ and the model is asked to update or drop it.  The task list
+    overlay in the buffer marks the same condition.
+  - ~gptel-agent-todos-max-injected~ (default 30): cap on items
+    injected, to bound token cost.
+
 - gptel-agent now works over TRAMP.  This means it can run processes on
   remote servers, grep and edit files and so on without the need to
   install Emacs or an agent harness.  This involves calling command line

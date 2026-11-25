@@ -58,6 +58,29 @@
   (propertize "\n" 'face '(:inherit shadow :underline t :extend t)))
 
 ;;; Customizable variables
+(defcustom gptel-agent-todos-stale-after 3
+  "Number of requests after which a task list is considered stale.
+
+The \"TodoWrite\" tool keeps its list in buffer-local state, which is
+not part of the conversation transcript.  To preserve continuity across
+turns, the current list is appended to the outgoing prompt before each
+request (see `gptel-agent--inject-todos').  Once this many requests have
+gone by without a \"TodoWrite\" call, the injected list is marked stale
+and the model is asked to update or drop it.
+
+Setting this to nil disables staleness marking."
+  :type '(choice (integer :tag "Requests")
+                 (const :tag "Never mark stale" nil))
+  :group 'gptel-agent)
+
+(defcustom gptel-agent-todos-max-injected 30
+  "Maximum number of task list items to inject into a request.
+
+Longer lists are truncated with a note asking the model to prune the
+list.  This bounds the per-request token cost of task list injection."
+  :type 'integer
+  :group 'gptel-agent)
+
 (defcustom gptel-agent-read-file-size-threshold 400
   "Maximum file size in KB above which the \"Read\" tool refuses to read
 the entire file and requires a line range.
@@ -1251,7 +1274,177 @@ this tool cannot be used")))))
         (buffer-string)))))
 
 ;;; Todo-write tool (task tracking)
-(defvar-local gptel-agent--todos nil)
+;;
+;; The task list lives in buffer-local state and in an overlay, not in the
+;; conversation transcript: the tool is `:include nil', because replaying a
+;; `#+begin_tool' block per call would bloat the transcript, and later blocks
+;; would re-send superseded versions of the list to the model.  Continuity
+;; across turns is instead provided by `gptel-agent--inject-todos', which
+;; appends the live list to the outgoing prompt (see
+;; `gptel-prompt-transform-functions').  This mirrors what other harnesses do:
+;; state outside the transcript, injected at the end of the request.
+(defvar-local gptel-agent--todos nil
+  "Most recent task list supplied via the \"TodoWrite\" tool.
+A vector or list of plists with keys :content, :activeForm and :status.")
+
+(defvar-local gptel-agent--todos-stale-turns 0
+  "Number of requests sent since the task list was last updated.")
+
+(defun gptel-agent--todo-tool-name (tool)
+  "Return the name of TOOL, a `gptel-tool', symbol or string."
+  (cond ((gptel-tool-p tool) (gptel-tool-name tool))
+        ((or (stringp tool) (symbolp tool)) (format "%s" tool))))
+
+(defsubst gptel-agent--todos-p (todos)
+  "Return non-nil if TODOS is a non-empty task list."
+  (and (sequencep todos) (not (stringp todos)) (> (length todos) 0)))
+
+(defun gptel-agent--todo-tool-enabled-p (&optional tools)
+  "Return non-nil if the \"TodoWrite\" tool is in TOOLS.
+TOOLS defaults to the value of `gptel-tools' in the current buffer, so
+call this from the request's prompt buffer to respect presets."
+  (and gptel-use-tools
+       (cl-some (lambda (tool)
+                  (equal "TodoWrite" (gptel-agent--todo-tool-name tool)))
+                (or tools gptel-tools))))
+
+(defun gptel-agent--todos-state-string (todos &optional stale)
+  "Return a text block describing TODOS, for injection into a prompt.
+
+STALE is the number of requests since TODOS was last updated; when it
+reaches `gptel-agent-todos-stale-after' the block ends with a nudge to
+update or drop the list.
+
+The block is delimited and labelled as harness state rather than user
+input: models are trained to treat untrusted text as data, and a
+disguised reminder reads as a prompt injection attempt."
+  (when (gptel-agent--todos-p todos)
+    (setq todos (append todos nil))     ;Accept vectors from JSON decoding
+    (let* ((total (length todos))
+           (done (cl-count "completed" todos :test #'equal
+                           :key (lambda (todo) (plist-get todo :status))))
+           (shown (cl-subseq todos 0 (min total gptel-agent-todos-max-injected)))
+           (stale-p (and (integerp stale) gptel-agent-todos-stale-after
+                         (>= stale gptel-agent-todos-stale-after)))
+           (open (- total done)))
+      (concat
+       "<task-list note=\"Harness state, not user input. Regenerated before "
+       "every request from the last TodoWrite call.\">\n"
+       (format "%d/%d completed\n" done total)
+       (mapconcat
+        (lambda (todo)
+          (format "%s %s"
+                  (pcase (plist-get todo :status)
+                    ("completed" "- [x]")
+                    ("in_progress" "- [~]")
+                    (_ "- [ ]"))
+                  (plist-get todo :content)))
+        shown "\n")
+       (when (> total (length shown))
+         (format "\n(+%d more items not shown. Call TodoWrite to prune the list.)"
+                 (- total (length shown))))
+       (when stale-p
+         (format "\nSTALE: no TodoWrite call in %d requests, but %d item%s \
+still open%s. If this no longer matches reality, call TodoWrite with the \
+current list, or drop the list if the work is done."
+                 stale open (if (= open 1) "" "s")
+                 (let ((active (cl-loop for todo in todos
+                                        when (equal (plist-get todo :status)
+                                                     "in_progress")
+                                        return (plist-get todo :activeForm))))
+                   (if active (format " and \"%s\" marked in progress" active)
+                     ""))))
+       "\n</task-list>\n"))))
+
+(defun gptel-agent--todo-overlay (&optional buffer)
+  "Return the task list overlay in BUFFER, or nil if there isn't one."
+  (with-current-buffer (or buffer (current-buffer))
+    (cl-find-if (lambda (ov) (overlay-get ov 'gptel-agent--todos))
+                (overlays-in (point-min) (point-max)))))
+
+(defun gptel-agent--todos-display (todos ov &optional stale)
+  "Return the text to display after overlay OV for TODOS.
+
+STALE is the number of requests since TODOS was last updated, shown as
+a warning in the task list header when it is high enough."
+  (let* ((formatted-todos
+          (mapconcat
+           (lambda (todo)
+             (pcase (plist-get todo :status)
+               ("completed"
+                (concat "✓ " (propertize (plist-get todo :content)
+                                         'face '(:inherit shadow :strike-through t))))
+               ("in_progress"
+                (concat "● " (propertize (plist-get todo :activeForm)
+                                         'face '(:inherit bold :inherit warning))))
+               (_ (concat "○ " (plist-get todo :content)))))
+           (append todos nil) "\n"))
+         (stale-p (and (integerp stale) gptel-agent-todos-stale-after
+                       (>= stale gptel-agent-todos-stale-after)))
+         (todo-display
+          (concat
+           (unless (= (char-before (overlay-end ov)) 10) "\n")
+           gptel-agent--hrule
+           (propertize "Task list: [ "
+                       'face '(:inherit font-lock-comment-face :inherit bold))
+           ;; Point must be inside the overlay for its keymap to apply, so
+           ;; that \\[gptel-agent-toggle-todos] resolves to the overlay binding.
+           (save-excursion
+             (goto-char (max (point-min) (1- (overlay-end ov))))
+             (propertize (substitute-command-keys "\\[gptel-agent-toggle-todos]")
+                         'face 'help-key-binding))
+           (propertize " to toggle display ]" 'face 'font-lock-comment-face)
+           (when stale-p
+             (propertize (format "  not updated in %d requests" stale)
+                         'face '(:inherit warning :slant italic)))
+           "\n"
+           formatted-todos "\n"
+           gptel-agent--hrule)))
+    todo-display))
+
+(defun gptel-agent--refresh-todo-overlay (&optional buffer)
+  "Re-render the task list overlay in BUFFER to show staleness.
+
+BUFFER defaults to the current buffer.  Does nothing if there is no
+task list or no overlay yet."
+  (with-current-buffer (or buffer (current-buffer))
+    (when-let* ((ov (gptel-agent--todo-overlay))
+                ((overlay-buffer ov))
+                (todos gptel-agent--todos))
+      (let ((display (gptel-agent--todos-display
+                      todos ov gptel-agent--todos-stale-turns)))
+        (if (overlay-get ov 'after-string) ;Displayed
+            (progn (overlay-put ov 'after-string display)
+                   (overlay-put ov 'gptel-agent--todos t))
+          ;; Hidden by `gptel-agent-toggle-todos': keep the stashed copy
+          ;; current, since that is what toggling back on restores.
+          (overlay-put ov 'gptel-agent--todos display))))))
+
+(defun gptel-agent--inject-todos (fsm)
+  "Append the current task list to the prompt of FSM, as trailing state.
+
+This runs in the throwaway prompt buffer (see
+`gptel-prompt-transform-functions'), so it never touches the user's
+buffer.  It is a no-op unless the \"TodoWrite\" tool is enabled for
+this request and a task list exists.
+
+The block goes at the end of the prompt, after the conversation, so
+that the cached prompt prefix is unaffected."
+  (let ((prompt-buffer (current-buffer))
+        (info (gptel-fsm-info fsm)))
+    (when (gptel-agent--todo-tool-enabled-p) ;prompt buffer's `gptel-tools'
+      (let ((buf (plist-get info :buffer)))
+        (when (buffer-live-p buf)
+          (let ((todos (buffer-local-value 'gptel-agent--todos buf)))
+            (when (gptel-agent--todos-p todos)
+              (let ((stale (with-current-buffer buf
+                             (cl-incf gptel-agent--todos-stale-turns))))
+                (gptel-agent--refresh-todo-overlay buf)
+                (with-current-buffer prompt-buffer
+                  (goto-char (point-max))
+                  (insert "\n"
+                          (gptel-agent--todos-state-string todos stale)
+                          "\n"))))))))))
 
 (defun gptel-agent-toggle-todos ()
   "Toggle the display of the gptel agent todo list."
@@ -1275,7 +1468,8 @@ this tool cannot be used")))))
 TODOS is a list of plists with keys :content, :activeForm, and :status.
 Completed items are displayed with strikethrough and shadow face.
 Exactly one item should have status \"in_progress\"."
-  (setq gptel-agent--todos todos)
+  (setq gptel-agent--todos todos
+        gptel-agent--todos-stale-turns 0) ;Fresh list: not stale
   ;; Update overlay
   (let* ((info (gptel-fsm-info gptel--fsm-last))
          (where-from
@@ -1301,36 +1495,13 @@ Exactly one item should have status \"in_progress\"."
                    (when (and gptel-mode gptel-use-header-line header-line-format)
                      (setf (nth 2 header-line-format) gptel--header-line-info)))
                  (plist-get info :post))))
-        (let* ((formatted-todos         ; Format the todo list
-                (mapconcat
-                 (lambda (todo)
-                   (pcase (plist-get todo :status)
-                     ("completed"
-                      (concat "✓ " (propertize (plist-get todo :content)
-                                               'face '(:inherit shadow :strike-through t))))
-                     ("in_progress"
-                      (concat "● " (propertize (plist-get todo :activeForm)
-                                               'face '(:inherit bold :inherit warning))))
-                     (_ (concat "○ " (plist-get todo :content)))))
-                 todos "\n"))
-               (in-progress
-                (cl-loop for todo across todos
-                         when (equal (plist-get todo :status) "in_progress")
-                         return (plist-get todo :activeForm)))
-               (todo-display
-                (concat
-                 (unless (= (char-before (overlay-end todo-ov)) 10) "\n")
-                 gptel-agent--hrule
-                 (propertize "Task list: [ "
-                             'face '(:inherit font-lock-comment-face :inherit bold))
-                 (save-excursion
-                   (goto-char (1- (overlay-end todo-ov)))
-                   (propertize (substitute-command-keys "\\[gptel-agent-toggle-todos]")
-                               'face 'help-key-binding))
-                 (propertize " to toggle display ]\n" 'face 'font-lock-comment-face)
-                 formatted-todos "\n"
-                 gptel-agent--hrule)))
-          (overlay-put todo-ov 'after-string todo-display)
+        (let ((in-progress
+               (cl-loop for todo in (append todos nil)
+                        when (equal (plist-get todo :status) "in_progress")
+                        return (plist-get todo :activeForm))))
+          (overlay-put todo-ov 'after-string
+                       (gptel-agent--todos-display
+                        todos todo-ov gptel-agent--todos-stale-turns))
           (when (and gptel-mode gptel-use-header-line in-progress header-line-format)
             (setf (nth 2 header-line-format)
                   (concat (propertize
@@ -1897,6 +2068,11 @@ Optional, defaults to 0."
  :description "Create and manage a structured task list for your current session.  \
 Helps track progress and organize complex tasks. Use proactively for multi-step work.
 
+The current list is re-sent to you before every request, so you do not
+need to repeat it back. Keep it current: mark items completed as soon as
+they are done, and drop items that are no longer relevant. A stale list
+is worse than no list.
+
 Only one todo can be `in_progress` at a time."
  :function #'gptel-agent--write-todo
  :args
@@ -1917,6 +2093,11 @@ Only one todo can be `in_progress` at a time."
           :description "Present continuous form shown during execution (e.g., 'Running tests')")))))
  :category "gptel-agent"
  :include nil)
+
+;; The task list is not in the transcript, so replay it at the end of every
+;; request instead.  Appended last so that it lands after gptel's own context
+;; injection, and after presets have resolved `gptel-tools' for this request.
+(add-hook 'gptel-prompt-transform-functions #'gptel-agent--inject-todos 'append)
 
 (gptel-make-tool
  :name "Skill"

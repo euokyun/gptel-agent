@@ -440,6 +440,147 @@ A non-unique OLD-STR must not be replaced at all."
     (should (equal (gptel-agent-test-file-content file)
                    "alpha\nbeta\ngamma\n"))))
 
+;;;; TodoWrite tool: cross-turn task list injection
+
+(defconst gptel-agent-test-todos
+  [(:content "Write the package" :status "completed"
+    :activeForm "Writing the package")
+   (:content "Write the module" :status "in_progress"
+    :activeForm "Writing the module")
+   (:content "Run tests" :status "pending"
+    :activeForm "Running tests")]
+  "Sample task list, a vector as returned by JSON decoding.")
+
+(ert-deftest gptel-agent-test-todos-state-string ()
+  "Test that the injected block lists every item and its status."
+  (let ((str (gptel-agent--todos-state-string gptel-agent-test-todos 0)))
+    (should (string-match-p "<task-list" str))
+    (should (string-match-p "1/3 completed" str))
+    (should (string-match-p "- \\[x\\] Write the package" str))
+    (should (string-match-p "- \\[~\\] Write the module" str))
+    (should (string-match-p "- \\[ \\] Run tests" str))
+    (should-not (string-match-p "STALE" str))))
+
+(ert-deftest gptel-agent-test-todos-state-string-nil ()
+  "Test that an empty task list injects nothing."
+  (should-not (gptel-agent--todos-state-string nil 0))
+  (should-not (gptel-agent--todos-state-string [] 0)))
+
+(ert-deftest gptel-agent-test-todos-state-string-stale ()
+  "Test that the block is marked stale only after the threshold."
+  (let ((gptel-agent-todos-stale-after 3))
+    (should-not (string-match-p
+                 "STALE" (gptel-agent--todos-state-string
+                          gptel-agent-test-todos 2)))
+    (let ((str (gptel-agent--todos-state-string gptel-agent-test-todos 3)))
+      (should (string-match-p "STALE" str))
+      ;; The nudge names the in-progress item so the model can judge it.
+      (should (string-match-p "Writing the module" str)))
+    ;; Staleness marking can be turned off.
+    (let ((gptel-agent-todos-stale-after nil))
+      (should-not (string-match-p
+                   "STALE" (gptel-agent--todos-state-string
+                            gptel-agent-test-todos 100))))))
+
+(ert-deftest gptel-agent-test-todos-state-string-truncated ()
+  "Test that long task lists are truncated with a note."
+  (let* ((gptel-agent-todos-max-injected 2)
+         (str (gptel-agent--todos-state-string gptel-agent-test-todos 0)))
+    (should (string-match-p "Write the package" str))
+    (should (string-match-p "Write the module" str))
+    (should-not (string-match-p "Run tests" str))
+    (should (string-match-p "+1 more items" str))))
+
+(ert-deftest gptel-agent-test-todo-tool-enabled-p ()
+  "Test that injection is gated on the TodoWrite tool being present."
+  (let ((todo (gptel-get-tool "TodoWrite"))
+        (other (gptel-get-tool "Read"))
+        (gptel-use-tools t))
+    (should (gptel-agent--todo-tool-enabled-p (list todo)))
+    (should (gptel-agent--todo-tool-enabled-p (list other todo)))
+    ;; Tool names are accepted too, as presets specify them.
+    (should (gptel-agent--todo-tool-enabled-p '("TodoWrite")))
+    (should-not (gptel-agent--todo-tool-enabled-p (list other)))
+    (should-not (gptel-agent--todo-tool-enabled-p nil))
+    ;; No tools are sent at all when tool use is off.
+    (let ((gptel-use-tools nil))
+      (should-not (gptel-agent--todo-tool-enabled-p (list todo))))))
+
+(ert-deftest gptel-agent-test-inject-todos-appends-to-prompt ()
+  "Test that the task list is appended to the prompt, not the buffer."
+  (with-temp-buffer
+    (setq-local gptel-tools (list (gptel-get-tool "TodoWrite"))
+                gptel-agent--todos gptel-agent-test-todos)
+    (let* ((gptel-buffer (current-buffer))
+           (gptel-agent--todos-stale-turns 2)
+           (fsm (gptel-make-fsm
+                 :info (list :buffer gptel-buffer)))
+           (prompt-buffer (generate-new-buffer " *test-prompt*")))
+      (unwind-protect
+          (progn
+            (with-current-buffer prompt-buffer
+              (insert "user question\n")
+              (setq-local gptel-tools (list (gptel-get-tool "TodoWrite")))
+              (gptel-agent--inject-todos fsm))
+            ;; Injected at the end of the prompt...
+            (should (string-match-p
+                     "\\`user question\n\n<task-list"
+                     (with-current-buffer prompt-buffer (buffer-string))))
+            ;; ...and the buffer itself is untouched.
+            (should (equal (buffer-string) ""))
+            ;; The staleness counter advanced.
+            (should (= gptel-agent--todos-stale-turns 3)))
+        (kill-buffer prompt-buffer)))))
+
+(ert-deftest gptel-agent-test-inject-todos-no-tool ()
+  "Test that nothing is injected when TodoWrite is not in use."
+  (with-temp-buffer
+    (setq-local gptel-tools (list (gptel-get-tool "Read"))
+                gptel-agent--todos gptel-agent-test-todos)
+    (let* ((buf (current-buffer))
+           (gptel-agent--todos-stale-turns 0)
+           (fsm (gptel-make-fsm :info (list :buffer buf)))
+           (prompt-buffer (generate-new-buffer " *test-prompt*")))
+      (unwind-protect
+          (progn
+            (with-current-buffer prompt-buffer
+              (insert "user question\n")
+              (setq-local gptel-tools (list (gptel-get-tool "Read")))
+              (gptel-agent--inject-todos fsm))
+            (should-not (string-match-p
+                         "task-list"
+                         (with-current-buffer prompt-buffer (buffer-string))))
+            (should (= gptel-agent--todos-stale-turns 0)))
+        (kill-buffer prompt-buffer)))))
+
+(ert-deftest gptel-agent-test-write-todo-resets-staleness ()
+  "Test that a TodoWrite call refreshes the overlay and the stale counter.
+Also covers both shapes the tool can receive: JSON decoding yields a
+vector, but callers may pass a plain list."
+  (dolist (todos (list gptel-agent-test-todos
+                       (append gptel-agent-test-todos nil)))
+    (with-temp-buffer
+      (insert "some response text")
+      (let* ((gptel--fsm-last
+              (gptel-make-fsm :info (list :position (point-max-marker))))
+             (gptel-mode t)
+             (gptel-use-header-line t)
+             (header-line-format '("" "" ""))
+             (gptel-agent--todos-stale-turns 7))
+        (gptel-agent--write-todo todos)
+        (should (= gptel-agent--todos-stale-turns 0))
+        (should (equal gptel-agent--todos todos))
+        (should (gptel-agent--todo-overlay))
+        ;; The header line names the in-progress item.
+        (should (string-match-p
+                 "Writing the module"
+                 (substring-no-properties (nth 2 header-line-format))))
+        ;; And the overlay shows the staleness-free list.
+        (should-not (string-match-p
+                     "not updated"
+                     (substring-no-properties
+                      (overlay-get (gptel-agent--todo-overlay) 'after-string))))))))
+
 (provide 'gptel-agent-test-tools)
 
 ;;; gptel-agent-test-tools.el ends here
