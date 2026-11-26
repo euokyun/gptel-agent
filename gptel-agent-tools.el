@@ -1651,6 +1651,22 @@ the known skills as string ready to be included to the context."
           (format "Could not load body of skill %s" skill))))))
 
 ;;; Task tool (sub-agent)
+(defun gptel-agent--task-terminal (fsm)
+  "Deliver the result of the sub-agent task driven by FSM.
+
+This is the terminal handler for the sub-agent's state machine, run from
+the DONE, ERRS and ABRT states, see `gptel-agent-request--handlers'.
+Delivery is idempotent, so this is a no-op when the request callback has
+already run."
+  (when-let* ((info (gptel-fsm-info fsm))
+              (finish (plist-get info :agent-finish)))
+    (funcall finish
+             (pcase (gptel-fsm-state fsm)
+               ('ERRS (format "the request failed with error: %S"
+                              (plist-get info :error)))
+               ('ABRT "the task was aborted")
+               (_ nil)))))
+
 (defvar gptel-agent-request--handlers
   `((WAIT ,#'gptel-agent--indicate-wait
           ,#'gptel--handle-wait)
@@ -1658,7 +1674,18 @@ the known skills as string ready to be included to the context."
     (TOOL ,#'gptel-agent--indicate-tool-call
           ,#'gptel--handle-tool-use)
     (TRET ,#'gptel--handle-post-tool
-          ,#'gptel--handle-tool-result))
+          ,#'gptel--handle-tool-result)
+    ;; The sub-agent's state machine ends in one of these states, and
+    ;; `gptel--fsm-transition' silently does nothing for a state that has no
+    ;; handler entry.  Without them, a sub-agent that fails or is aborted
+    ;; delivers no result, and the parent request is stranded in the TOOL
+    ;; state waiting for a tool result that never comes.
+    (DONE ,#'gptel--handle-post
+          ,#'gptel-agent--task-terminal)
+    (ERRS ,#'gptel--handle-post
+          ,#'gptel-agent--task-terminal)
+    (ABRT ,#'gptel--handle-post
+          ,#'gptel-agent--task-terminal))
   "See `gptel-request--handlers'.")
 
 (defun gptel-agent--task-preview-setup (arg-values _info)
