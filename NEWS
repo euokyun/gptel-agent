@@ -57,6 +57,18 @@
         '(:backend "Gemini" :model gemini-flash-lite-latest))
   #+end_src
 
+- Two new user options bound the cost of a runaway sub-agent task (the
+  ~Agent~ tool):
+  - ~gptel-agent-task-timeout~ (default 900 seconds): a sub-agent task
+    that runs longer than this is failed.  Its overlay is removed, an
+    error is returned to the calling model, and the request is aborted
+    instead of lingering in the background.  Set it to ~nil~ to wait
+    indefinitely.
+  - ~gptel-agent-max-prompt-chars~ (default 600000): sub-agent prompts
+    longer than this are refused up front, with an error telling the
+    model to narrow the task or point the agent at files instead of
+    pasting their contents in.  Set it to ~nil~ to disable the limit.
+
 - New command ~gptel-agent-compact~ to compact/summarize a conversation
   and free up the context window.  It works on the buffer up to the
   cursor position or on the active region, so you can compact a part of

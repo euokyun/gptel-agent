@@ -107,6 +107,32 @@ parameters take precedence over this value."
                  (plist  :tag "Preset plist spec"))
   :group 'gptel-agent)
 
+(defcustom gptel-agent-task-timeout 900
+  "Seconds to wait for a sub-agent task before failing it.
+
+If a request started by the \"Agent\" tool runs longer than this, the
+task is failed: its overlay is removed, an error is returned to the
+calling LLM, and the sub-agent request is aborted so that it does not
+keep running in the background.
+
+Set this to nil to wait indefinitely."
+  :type '(choice (integer :tag "Seconds")
+                 (const :tag "Never time out" nil))
+  :group 'gptel-agent)
+
+(defcustom gptel-agent-max-prompt-chars 600000
+  "Maximum length in characters of a sub-agent prompt.
+
+The \"Agent\" tool refuses longer prompts before sending them and
+returns an error to the calling LLM instead, since a prompt this large
+is usually a sign that the task should be narrowed or that context
+should be passed by reference instead of being pasted in.
+
+Set this to nil to disable the limit."
+  :type '(choice (integer :tag "Characters")
+                 (const :tag "No limit" nil))
+  :group 'gptel-agent)
+
 ;;; Tool use preview
 (defun gptel-agent--confirm-overlay (from to &optional no-hide)
   "Set up tool call preview overlay FROM TO.
@@ -1667,6 +1693,27 @@ already run."
                ('ABRT "the task was aborted")
                (_ nil)))))
 
+(defun gptel-agent--task-abort (fsm)
+  "Abort the single sub-agent request driven by FSM.
+
+`gptel-abort' cannot be used for this: it aborts the first request it
+finds for the current *buffer*, and a sub-agent request shares its
+parent's buffer, so the parent could be aborted instead.  Drop the
+request from `gptel--request-alist', kill its process (or the buffer
+`url-retrieve' left behind) and move FSM to ABRT so that its terminal
+handlers run."
+  (when-let* ((entry (cl-find-if (lambda (entry) (eq (cadr entry) fsm))
+                                 gptel--request-alist))
+              (key (car entry)))
+    (when (functionp (cddr entry))
+      (with-demoted-errors "gptel-agent: request abort function failed: %S"
+        (funcall (cddr entry))))
+    (setf (alist-get key gptel--request-alist nil 'remove) nil)
+    (with-demoted-errors "gptel-agent: could not stop sub-agent request: %S"
+      (cond ((processp key) (delete-process key))
+            ((buffer-live-p key) (kill-buffer key))))
+    (gptel--fsm-transition fsm 'ABRT)))
+
 (defvar gptel-agent-request--handlers
   `((WAIT ,#'gptel-agent--indicate-wait
           ,#'gptel--handle-wait)
@@ -1796,6 +1843,7 @@ DESCRIPTION is a short description of the task.
 PROMPT is the detailed prompt instructing the agent on what is required."
   (let* ((delivered nil)               ;Has MAIN-CB been run?
          (overlay nil)
+         (timer nil)                    ;Watchdog, see `gptel-agent-task-timeout'
          (fsm (gptel-make-fsm :table gptel-send--transitions
                               :handlers gptel-agent-request--handlers))
          (partial (format "%s result for task: %s\n\n"
@@ -1807,9 +1855,10 @@ PROMPT is the detailed prompt instructing the agent on what is required."
 
 ERROR, if non-nil, is a string explaining why there is no result; it is
 delivered as an error result instead of the accumulated text.  The task
-overlay is removed on every call."
+overlay is removed and the watchdog cancelled on every call."
           (unless delivered
             (setq delivered t)
+            (when (timerp timer) (cancel-timer timer))
             (when (overlayp overlay) (delete-overlay overlay))
             (if error
                 (funcall main-cb
@@ -1821,66 +1870,90 @@ Retry with a narrower task, or do this work yourself."
                             (transformer (plist-get info :transformer)))
                   (setq result (funcall transformer result)))
                 (funcall main-cb result))))))
-      ;; The Agent tool is asynchronous, so gptel does not wrap this call in a
-      ;; `condition-case' (it only guards the synchronous branch of
-      ;; `gptel-request').  A signal here -- from a stale `gptel--fsm-last',
-      ;; from `gptel-with-preset' with an unknown preset, or from the agent
-      ;; file -- would escape into gptel's process sentinel and strand the
-      ;; parent request in the TOOL state, so turn it into an error result.
-      (condition-case err
-          (gptel-with-preset
-              (nconc (list :include-reasoning nil
-                           :use-tools t
-                           :context nil) ;Can be overriden by agent
-                      (and gptel-agent-preset
-                           (copy-sequence
-                            (cl-etypecase gptel-agent-preset
-                              (symbol (gptel-get-preset gptel-agent-preset))
-                              (plist gptel-agent-preset))))
-                      (cdr (assoc agent-type gptel-agent--agents)))
-            (let* ((info (gptel-fsm-info gptel--fsm-last))
-                   (where (or (plist-get info :tracking-marker)
-                              (plist-get info :position))))
-              (gptel--update-status " Calling Agent..." 'font-lock-escape-face)
-              (setq overlay (gptel-agent--task-overlay where agent-type description))
-              (gptel-request prompt
-                :context overlay
-                :fsm fsm
-                :transforms (list #'gptel--transform-add-context)
-                :callback
-                (lambda (resp info)
-                  (pcase resp
-                    ('nil                ;The request failed
-                     (finish (format "the request ended with an error: %S"
-                                     (plist-get info :error))))
-                    (`(tool-call . ,calls)
-                     (unless (plist-get info :tracking-marker)
-                       (plist-put info :tracking-marker where))
-                     (gptel--display-tool-calls calls info))
-                    ('t                  ;Stream finished, deliver what we have
-                     (unless (plist-get info :tool-use) (finish)))
-                    ((or `(reasoning . ,_) `(tool-result . ,_))
-                     nil)               ;Not part of the task's result
-                    ('abort
-                     (finish "the task was aborted by the user"))
-                    ((pred stringp)
-                     (setq partial (concat partial resp))
-                     ;; A streamed response arrives in chunks and this callback
-                     ;; runs for each one, so only deliver once gptel reports
-                     ;; the end of the stream (RESP is t).  Either way, don't
-                     ;; deliver while tool calls are pending: the agent isn't
-                     ;; done.
-                     (unless (or (plist-get info :stream)
-                                 (plist-get info :tool-use))
-                       (finish))))))
-              ;; Let the terminal FSM handlers deliver the result when the
-              ;; request dies without giving the callback a chance to.
-              (setf (gptel-fsm-info fsm)
-                    (plist-put (gptel-fsm-info fsm) :agent-finish #'finish))))
-        (error
-         (finish (format "error %S: %S.  This is likely a setup problem --
+      ;; Refuse an oversized prompt before spending a request on it.  This is
+      ;; typically a large blob of context that should have been passed by
+      ;; reference, so tell the model to narrow the task instead.
+      (if (and gptel-agent-max-prompt-chars
+               (> (length prompt) gptel-agent-max-prompt-chars))
+          (finish (format "the prompt is %d characters long, over the %d
+character limit set by `gptel-agent-max-prompt-chars'.  Narrow the task, or
+point the agent at files instead of inlining their contents."
+                          (length prompt) gptel-agent-max-prompt-chars))
+        ;; The Agent tool is asynchronous, so gptel does not wrap this call in
+        ;; a `condition-case' (it only guards the synchronous branch of
+        ;; `gptel-request').  A signal here -- from a stale `gptel--fsm-last',
+        ;; from `gptel-with-preset' with an unknown preset, or from the agent
+        ;; file -- would escape into gptel's process sentinel and strand the
+        ;; parent request in the TOOL state, so turn it into an error result.
+        (condition-case err
+            (gptel-with-preset
+                (nconc (list :include-reasoning nil
+                             :use-tools t
+                             :context nil) ;Can be overriden by agent
+                        (and gptel-agent-preset
+                             (copy-sequence
+                              (cl-etypecase gptel-agent-preset
+                                (symbol (gptel-get-preset gptel-agent-preset))
+                                (plist gptel-agent-preset))))
+                        (cdr (assoc agent-type gptel-agent--agents)))
+              (let* ((info (gptel-fsm-info gptel--fsm-last))
+                     (where (or (plist-get info :tracking-marker)
+                                (plist-get info :position))))
+                (gptel--update-status " Calling Agent..." 'font-lock-escape-face)
+                (setq overlay (gptel-agent--task-overlay where agent-type description))
+                (gptel-request prompt
+                  :context overlay
+                  :fsm fsm
+                  :transforms (list #'gptel--transform-add-context)
+                  :callback
+                  (lambda (resp info)
+                    (pcase resp
+                      ('nil              ;The request failed
+                       (finish (format "the request ended with an error: %S"
+                                       (plist-get info :error))))
+                      (`(tool-call . ,calls)
+                       (unless (plist-get info :tracking-marker)
+                         (plist-put info :tracking-marker where))
+                       (gptel--display-tool-calls calls info))
+                      ('t                ;Stream finished, deliver what we have
+                       (unless (plist-get info :tool-use) (finish)))
+                      ((or `(reasoning . ,_) `(tool-result . ,_))
+                       nil)             ;Not part of the task's result
+                      ('abort
+                       (finish "the task was aborted by the user"))
+                      ((pred stringp)
+                       (setq partial (concat partial resp))
+                       ;; A streamed response arrives in chunks and this
+                       ;; callback runs for each one, so only deliver once gptel
+                       ;; reports the end of the stream (RESP is t).  Either
+                       ;; way, don't deliver while tool calls are pending: the
+                       ;; agent isn't done.
+                       (unless (or (plist-get info :stream)
+                                   (plist-get info :tool-use))
+                         (finish))))))
+                ;; Let the terminal FSM handlers deliver the result when the
+                ;; request dies without giving the callback a chance to.
+                (setf (gptel-fsm-info fsm)
+                      (plist-put (gptel-fsm-info fsm) :agent-finish #'finish))
+                ;; Watchdog: a sub-agent that never finishes would otherwise
+                ;; leave the parent request waiting for a tool result forever.
+                (when gptel-agent-task-timeout
+                  (setq timer
+                        (run-at-time
+                         gptel-agent-task-timeout nil
+                         (lambda ()
+                           (when (and (not delivered)
+                                      ;; Still running?
+                                      (not (memq (gptel-fsm-state fsm)
+                                                 '(ERRS ABRT DONE))))
+                             (finish (format "it did not finish within %s
+seconds (`gptel-agent-task-timeout')."
+                                             gptel-agent-task-timeout))
+                             (gptel-agent--task-abort fsm))))))))
+          (error
+           (finish (format "error %S: %S.  This is likely a setup problem --
 check `gptel-agent-preset', the agent definition and the request state."
-                         (car err) (cdr err))))))))
+                           (car err) (cdr err)))))))))
 
 ;;; Register tool call preview functions
 
