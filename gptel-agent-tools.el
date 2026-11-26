@@ -331,27 +331,35 @@ ARG-VALUES is the list of arguments for the tool call."
 
 CALLBACK is called with the command output string when the process finishes.
 COMMAND is the bash command string to execute."
-  (let* ((output-buffer (generate-new-buffer " *gptel-agent-bash*"))
-         (proc (make-process
-                :name "gptel-agent-bash"
-                :buffer output-buffer
-                :command (list "bash" "-c" command)
-                :connection-type 'pipe
-                :file-handler t
-                :sentinel
-                (lambda (process _event)
-                  (when (memq (process-status process) '(exit signal))
-                    (let* ((exit-code (process-exit-status process))
-                           (output (with-current-buffer (process-buffer process)
-                                     (gptel-agent--sanitize-buffer "Bash")
-                                     (buffer-string))))
-                      (kill-buffer (process-buffer process))
-                      (funcall callback
-                               (if (zerop exit-code)
-                                   output
-                                 (format "Command failed with exit code %d:\nSTDOUT+STDERR:\n%s"
-                                         exit-code output)))))))))
-    proc))
+  (let ((output-buffer (generate-new-buffer " *gptel-agent-bash*")))
+    (condition-case err
+        (make-process
+         :name "gptel-agent-bash"
+         :buffer output-buffer
+         :command (list "bash" "-c" command)
+         :connection-type 'pipe
+         :file-handler t
+         :sentinel
+         (lambda (process _event)
+           (when (memq (process-status process) '(exit signal))
+             (let* ((exit-code (process-exit-status process))
+                    (output (with-current-buffer (process-buffer process)
+                              (gptel-agent--sanitize-buffer "Bash")
+                              (buffer-string))))
+               (kill-buffer (process-buffer process))
+               (funcall callback
+                        (if (zerop exit-code)
+                            output
+                          (format "Command failed with exit code %d:\nSTDOUT+STDERR:\n%s"
+                                  exit-code output)))))))
+      ;; `make-process' can signal, for example when bash is missing or a
+      ;; TRAMP connection fails.  This tool is async, so gptel does not catch
+      ;; it: report the failure through CALLBACK so the request continues.
+      (error
+       (when (buffer-live-p output-buffer) (kill-buffer output-buffer))
+       (funcall callback
+                (format "Error: could not run Bash command: %s"
+                        (error-message-string err)))))))
 
 ;;; Web tools
 
@@ -416,15 +424,22 @@ COUNT is the number of results to return (default 5)."
          (lambda (buf) (and (buffer-live-p buf)
                        (process-live-p (get-buffer-process buf))))
          gptel-agent--web-search-active))
-  (if (>= (length gptel-agent--web-search-active) 2)
-      (progn (message "Web search: waiting for turn")
-             (run-at-time 5 nil #'gptel-agent--web-search-eww
-                          tool-cb query count))
-    (push (gptel-agent--fetch-with-timeout
-           (concat eww-search-prefix (url-hexify-string query))
-           #'gptel-agent--web-search-eww-callback
-           tool-cb (format "Web search for \"%s\"" query))
-          gptel-agent--web-search-active)))
+  (condition-case err
+      (if (>= (length gptel-agent--web-search-active) 2)
+          (progn (message "Web search: waiting for turn")
+                 (run-at-time 5 nil #'gptel-agent--web-search-eww
+                              tool-cb query count))
+        (push (gptel-agent--fetch-with-timeout
+               (concat eww-search-prefix (url-hexify-string query))
+               #'gptel-agent--web-search-eww-callback
+               tool-cb (format "Web search for \"%s\"" query))
+              gptel-agent--web-search-active))
+    ;; This tool is async, so gptel does not catch signals from it: report
+    ;; the failure through TOOL-CB so the request continues.
+    (error
+     (funcall tool-cb
+              (format "Error: web search for \"%s\" could not be started: %s"
+                      query (error-message-string err))))))
 
 (defun gptel-agent--web-search-eww-callback (cb)
   "Extract website text and run callback CB with it."
@@ -469,44 +484,50 @@ COUNT is the number of results to return (default 5)."
 
 If URL is a YouTube video, fetch the video description and transcript
 instead."
-  (if-let ((video-id (gptel-agent--yt-video-id url)))
-      (gptel-agent--yt-fetch-watch-page tool-cb video-id)
-    (gptel-agent--fetch-with-timeout
-     url
-     (lambda (cb)
-       (condition-case errdata
-           (let ((body-start (if url-http-end-of-headers
+  (condition-case err
+      (if-let ((video-id (gptel-agent--yt-video-id url)))
+          (gptel-agent--yt-fetch-watch-page tool-cb video-id)
+        (gptel-agent--fetch-with-timeout
+         url
+         (lambda (cb)
+           (condition-case errdata
+               (let ((body-start (if url-http-end-of-headers
+                                     (save-excursion
+                                       (goto-char url-http-end-of-headers)
+                                       (point))
+                                   (goto-char (point-min)) (forward-paragraph)
+                                   (point)))
+                     (ctype (and url-http-end-of-headers
                                  (save-excursion
-                                   (goto-char url-http-end-of-headers)
-                                   (point))
-                               (goto-char (point-min)) (forward-paragraph)
-                               (point)))
-                 (ctype (and url-http-end-of-headers
-                             (save-excursion
-                               (goto-char (point-min))
-                               (mail-fetch-field "content-type")))))
-             ;; Bare NUL scan: the body is parsed as HTML below when not binary.
-             (if (save-excursion (goto-char body-start)
-                                 (skip-chars-forward "^\0")
-                                 (not (eobp)))
-                 (funcall
-                  cb (concat "[WebFetch: binary content"
-                             (and ctype ;Header values are untrusted bytes and bypass libxml2
-                                  (format " (%s)" (replace-regexp-in-string
-                                                   "[^[:ascii:]]" "?" ctype)))
-                             " at URL.  Use the Bash tool with curl(1) or \
+                                   (goto-char (point-min))
+                                   (mail-fetch-field "content-type")))))
+                 ;; Bare NUL scan: the body is parsed as HTML below when not binary.
+                 (if (save-excursion (goto-char body-start)
+                                     (skip-chars-forward "^\0")
+                                     (not (eobp)))
+                     (funcall
+                      cb (concat "[WebFetch: binary content"
+                                 (and ctype ;Header values are untrusted bytes and bypass libxml2
+                                      (format " (%s)" (replace-regexp-in-string
+                                                       "[^[:ascii:]]" "?" ctype)))
+                                 " at URL.  Use the Bash tool with curl(1) or \
 wget(1) to download it, then inspect it with file(1), strings(1), \
 pdftotext(1) or base64(1)]"))
-               ;; NOTE: libxml2 replaces unencodable chars with placeholders
-               (let ((dom (libxml-parse-html-region body-start (point-max))))
-                 (with-temp-buffer
-                   (eww-score-readability dom)
-                   (shr-insert-document (eww-highest-readability dom))
-                   (funcall cb (buffer-substring-no-properties
-                                (point-min) (point-max)))))))
-         (error (funcall cb (format "Error: Request failed with error data:\n%S"
-                                    errdata)))))
-     tool-cb (format "Fetch for \"%s\"" url))))
+                   ;; NOTE: libxml2 replaces unencodable chars with placeholders
+                   (let ((dom (libxml-parse-html-region body-start (point-max))))
+                     (with-temp-buffer
+                       (eww-score-readability dom)
+                       (shr-insert-document (eww-highest-readability dom))
+                       (funcall cb (buffer-substring-no-properties
+                                    (point-min) (point-max)))))))
+             (error (funcall cb (format "Error: Request failed with error data:\n%S"
+                                        errdata)))))
+         tool-cb (format "Fetch for \"%s\"" url)))
+    ;; This tool is async, so gptel does not catch signals from it: report
+    ;; the failure through TOOL-CB so the request continues.
+    (error
+     (funcall tool-cb (format "Error: could not fetch <%s>: %s"
+                              url (error-message-string err))))))
 
 ;;;; Fetch youtube transcript
 (defun gptel-agent--yt-video-id (url)
