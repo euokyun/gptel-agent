@@ -75,6 +75,22 @@
 
 ** Notable bug fixes
 
+- The ~Glob~ tool was reworked.  It now
+  - returns only regular files, so directory entries and the ~tree~
+    report footer no longer leak into the results,
+  - sorts all results by modification time, newest first.  The ~tree~
+    backend previously sorted per directory only, so the ordering
+    differed from the ~find~ backend's.
+  - reports unreadable directories instead of silently dropping them.
+    ~--prune~ used to hide ~tree~'s errors, making truncated results
+    look like "no such file".
+  - no longer needs GNU ~find~: ~-printf~ is gone, since sorting happens
+    in Lisp.
+  - validates ~depth~ (a positive integer or a numeric string) instead
+    of forwarding ~0~ to ~tree~ and surfacing its usage error, and
+    distinguishes a nonexistent path from an unreadable one.
+  - states explicitly when nothing matched.
+
 # Local Variables:
 # fill-column: 72
 # End:

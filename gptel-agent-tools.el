@@ -1052,7 +1052,7 @@ MAX-LINES is the number of lines to keep, defaulting to 50."
       ;; Insert truncated header
       (goto-char (point-min))
       (insert (format "%s results too large (%d chars, %d lines) \
- for context window.\nStored in: %s\n\nFirst %d lines:\n\n"
+for context window.\nStored in: %s\n\nFirst %d lines:\n\n"
                       prefix orig-size orig-lines temp-file max-lines))
       ;; Truncate to first max-lines lines
       (forward-line max-lines)
@@ -1063,70 +1063,170 @@ MAX-LINES is the number of lines to keep, defaulting to 50."
                       temp-file)))))
 
 (defun gptel-agent--glob (pattern &optional path depth)
-  "Find files matching PATTERN using `tree' or GNU find.
+  "Find files matching PATTERN using `tree', or `find' as a fallback.
 
 PATTERN is a case-insensitive glob pattern applied to file
 basenames, like \"*.el\".
-PATH is the optional directory to search (defaults to current directory).
-DEPTH limits recursion depth when provided (non-negative integer).
+PATH is the optional directory to search (defaults to current
+directory).  DEPTH limits recursion depth when provided (a positive
+integer, or a string of digits).
 
-Uses `tree' when available, falling back to GNU find.  Hidden files
-and directories are included; .git directories are skipped.
+Uses `tree' when available, falling back to `find'.  Hidden files and
+directories are included; .git directories are skipped.  Only regular
+files are returned, sorted by modification time, newest first, so the
+two backends agree on both the file set and the ordering.  (Files
+written in the same second keep the order the helper program
+produced.)
 
-Returns a string listing matching files with full paths, sorted by
-modification time, newest first.  If the output is too large (>20000
-chars), it writes the full results to a temporary file and returns a
-truncated version with instructions to use `Read' for the full
-contents.
+Returns a string listing matching files with full paths, or a notice
+when nothing matched.  A warning is prepended when the helper program
+reported errors, so that unreadable directories are not silently
+skipped.  If the output is too large (>20000 chars), it writes the
+full results to a temporary file and returns a truncated version with
+instructions to use `Read' for the full contents.
 
-Raises an error if PATTERN is empty, PATH is not readable, or
-neither the `tree' nor the `find' executable is found."
-  (when (string-empty-p pattern)
-    (error "Error: pattern must not be empty"))
-  (if path
-      (unless (and (file-readable-p path) (file-directory-p path))
-        (error "Error: path %s is not readable" path))
-    (setq path "."))
-  (let* ((use-tree (executable-find "tree" t))
-         (program (cond (use-tree "tree")
-                        ((executable-find "find" t) "find")
-                        (t (error "Error: Neither `tree` nor `find` \
-executable found.  This tool cannot be used"))))
-         (full-path (expand-file-name path)))
-    (with-temp-buffer
-      (let* ((local-path (file-local-name full-path))
-             (args
-              (if use-tree
-                  (let ((tree-args (list "-a" "-r" "-l" "-f" "-i" "-I" ".git"
-                                         "--sort=mtime" "--ignore-case"
-                                         "--prune" "-P" pattern local-path)))
-                    (if (natnump depth)
-                        (nconc tree-args
-                               (list "-L" (number-to-string depth)))
-                      tree-args))
-                (nconc
-                 (list "-L" local-path)
-                 (and (natnump depth)
-                      (list "-maxdepth" (number-to-string depth)))
-                 (list "(" "-name" ".git" ")" "-prune"
-                       "-o" "(" "-type" "f" "-iname" pattern
-                       "-printf" "%30T@\t%p\n" ")"))))
-             (exit-code (apply #'process-file program nil t nil args)))
-        (unless use-tree
-          ;; find prints "%30T@\t%p\n" per match: drop diagnostics that
-          ;; leaked into stdout, sort by mtime newest first (the padded
-          ;; timestamp makes a lexicographic sort equivalent to a
-          ;; numeric one), then strip the timestamp field.
-          (when (> (buffer-size) 0)
-            (keep-lines "^[ 0-9.]+\t" (point-min) (point-max))
-            (sort-lines t (point-min) (point-max))
-            (goto-char (point-min))
-            (while (re-search-forward "^[ 0-9.]+\t" nil t)
-              (replace-match ""))))
-        (when (/= exit-code 0)
-          (goto-char (point-min))
-          (insert (format "Glob failed with exit code %d\n.STDOUT:\n\n"
-                          exit-code)))
+Raises an error if PATTERN is empty, PATH is not a readable directory,
+DEPTH is not a positive integer, or neither the `tree' nor the `find'
+executable is found."
+  (cl-labels
+      ((pick-program ()
+         "Return the helper program to use.
+Signal an error when neither `tree' nor `find' is available."
+         (cond ((executable-find "tree" t) "tree")
+               ((executable-find "find" t) "find")
+               (t (error "Error: Neither `tree` nor `find` executable \
+found.  This tool cannot be used"))))
+       (check-depth (value)
+         "Return VALUE as a positive integer, or nil when unlimited.
+Nothing is returned unless VALUE is nil or a positive integer;
+strings are accepted since tool arguments may arrive as strings."
+         (when value
+           (let ((n (if (stringp value) (string-to-number value) value)))
+             (unless (and (integerp n) (> n 0))
+               (error "Error: depth must be a positive integer, got %S"
+                      value))
+             n)))
+       (command (program dir level)
+         "Return the argument list for PROGRAM to match PATTERN in DIR.
+PROGRAM is either \"tree\" or \"find\".  DIR is the local name of an
+absolute directory name.  LEVEL, when non-nil, limits recursion."
+         (if (string= program "tree")
+             (append (list "-a" "-l" "-f" "-i" "--ignore-case" "-I" ".git"
+                           "-P" pattern "--noreport")
+                     (and level (list "-L" (number-to-string level)))
+                     (list dir))
+           (append (list "-L" dir)
+                   (and level (list "-maxdepth" (number-to-string level)))
+                   (list "(" "-name" ".git" ")" "-prune"
+                         "-o" "(" "-type" "f" "-iname" pattern
+                         "-print" ")"))))
+       (mtime (file)
+         "Return the modification time of FILE, following symbolic links.
+Fall back to the epoch when FILE cannot be stat'ed."
+         (or (ignore-errors
+               (file-attribute-modification-time
+                (file-attributes (file-truename file))))
+             '(0 0 0 0)))
+       (sort-newest-first (entries)
+         "Return the file names in ENTRIES sorted by mtime, newest first.
+ENTRIES is a list of (MTIME . FILE) conses, as returned by
+`parse-output'.  Ties keep their original order."
+         (mapcar #'cdr
+                 (sort entries (lambda (a b) (time-less-p (car b) (car a))))))
+       (parse-output (lines)
+         "Return (ENTRIES . ERRORS) parsed from helper program output LINES.
+Each ENTRY is a cons of the file's modification time and its absolute
+name, so sorting by time needs no further file system access.  ERRORS
+collects lines that are neither files nor directories, which is how
+`tree' and `find' report unreadable directories.  `tree' decorations
+are stripped: \"path -> target\" for symlinks and \"[error ...]\" or
+\"[recursive, not followed]\" for problems."
+         (let (entries errors)
+           (dolist (line lines)
+             (cond
+              ((string-empty-p line))
+              ((string-match-p "\\[recursive, " line)) ; benign symlink loop
+              ((string-match-p "\\[error " line)
+               (push line errors))
+              (t
+               (let* ((stripped (and (string-match "\\`\\(.*?\\) -> " line)
+                                     (match-string 1 line)))
+                      ;; Strip tree's "path -> target" symlink decoration,
+                      ;; unless the whole line names an existing file,
+                      ;; i.e. unless the file is literally "a -> b".
+                      (name (if (and stripped (not (file-exists-p line)))
+                                stripped
+                              line))
+                      (attrs (file-attributes name))
+                      (type (file-attribute-type attrs)))
+                 (cond
+                  ((null attrs) (push line errors)) ; vanished, unreadable
+                  ((eq type t))                     ; a directory: no match
+                  ((null type)                      ; a regular file
+                   (push (cons (mtime name) (expand-file-name name))
+                         entries))
+                  ((stringp type)                   ; a link: judge target
+                   (when (file-regular-p name)
+                     (push (cons (mtime name) (expand-file-name name))
+                           entries)))
+                  (t (push line errors)))))))
+           (cons (nreverse entries) (delete-dups (nreverse errors)))))
+       (search (dir level)
+         "Return (FILES . WARNING) for PATTERN under DIR, recursing LEVEL deep.
+FILES is a list of absolute names of regular files, sorted by
+modification time, newest first.  WARNING is nil, or a string
+explaining that the results are incomplete because the helper program
+reported errors, such as unreadable directories."
+         (let* ((program (pick-program))
+                (args (command program (file-local-name
+                                        (expand-file-name dir))
+                               level))
+                exit-code
+                ;; Standard error is mixed into the output on purpose:
+                ;; the helper's diagnostics then reach the caller over
+                ;; TRAMP too, where a separate STDERR-FILE would not
+                ;; come back to this machine.  `parse-output' sorts them
+                ;; out.
+                (output (with-temp-buffer
+                          (setq exit-code
+                                (apply #'process-file program nil t nil args))
+                          (buffer-string)))
+                (parsed (parse-output (split-string output "\n" t)))
+                (errors (cdr parsed)))
+           (cons (sort-newest-first (car parsed))
+                 (when (or (not (equal exit-code 0)) errors)
+                   (format "[Glob warning: results may be incomplete%s.%s]"
+                           (if (equal exit-code 0)
+                               ""
+                             (format " (%s exited with code %s)"
+                                     program exit-code))
+                           (if errors
+                               (concat "\n" (string-join errors "\n") "\n")
+                             "")))))))
+    (when (string-empty-p pattern)
+      (error "Error: pattern must not be empty"))
+    (setq path (or path "."))
+    (unless (file-exists-p path)
+      (error "Error: path %s does not exist" path))
+    (unless (file-directory-p path)
+      (error "Error: path %s is not a directory" path))
+    (unless (file-readable-p path)
+      (error "Error: path %s is not readable" path))
+    (let* ((level (check-depth depth))
+           (found (search path level))
+           (files (car found)))
+      (with-temp-buffer
+        ;; The warning goes first so that truncation keeps it: a
+        ;; truncated answer must still announce the directories that
+        ;; could not be read.
+        (when (cdr found)
+          (insert (cdr found) "\n\n"))
+        (if files
+            (dolist (file files)
+              (insert file "\n"))
+          (insert (format "No files matching \"%s\" found in %s\n"
+                          pattern
+                          (abbreviate-file-name (expand-file-name path)))))
         (gptel-agent--truncate-buffer "glob")
         (buffer-string)))))
 
@@ -1984,7 +2084,9 @@ Consider using the more granular tools \"Insert\" or \"Edit\" first."
 - Does not support double wildcard \"**/*\".
 - Hidden files and directories are included, except `.git` directories,
   which are always omitted.
-- Returns matching file paths at all depths sorted by modification time.
+- Returns only regular files, sorted by modification time, newest
+  first.  When the search was incomplete (unreadable directories), a
+  warning line listing the failures is prepended to the results.
   Limit the depth of the search by providing the `depth` argument.
 - When you are doing an open ended search that may require multiple rounds
   of globbing and grepping, use the \"Agent\" tool instead

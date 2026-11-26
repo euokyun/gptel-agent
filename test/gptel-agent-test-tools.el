@@ -342,6 +342,78 @@ The path argument is rejected before any external program runs."
       (should (string-match-p "results too large" result))
       (should (string-match-p "Stored in:" result)))))
 
+(gptel-agent-test-deftest-glob gptel-agent-test-glob-sorts-across-directories
+  "Test that results are sorted by mtime across directory boundaries.
+The `tree' backend sorts within each directory only, so this guards
+against a per-directory ordering leaking out."
+  (gptel-agent-test-with-temp-dir
+    (gptel-agent-test-glob-fixture)
+    (set-file-times (expand-file-name "sub/deep.txt") (seconds-to-time 2000000000))
+    (set-file-times (expand-file-name "new.txt") (seconds-to-time 1900000000))
+    (let* ((result (gptel-agent-test-glob-invoke "*.txt"))
+           (deep-pos (string-match (regexp-quote (expand-file-name "sub/deep.txt"))
+                                   result))
+           (new-pos (string-match (regexp-quote (expand-file-name "new.txt"))
+                                  result))
+           (old-pos (string-match (regexp-quote (expand-file-name "old.txt"))
+                                  result)))
+      (should (< deep-pos new-pos))
+      (should (< new-pos old-pos)))))
+
+(gptel-agent-test-deftest-glob gptel-agent-test-glob-symlinked-file
+  "Test that symlinks are listed as paths without the \" -> \" decoration."
+  (gptel-agent-test-with-temp-dir
+    (gptel-agent-test-glob-fixture)
+    (make-symbolic-link "new.txt" (expand-file-name "link.txt"))
+    (let ((result (gptel-agent-test-glob-invoke "*.txt")))
+      (should (string-match-p (regexp-quote (expand-file-name "link.txt")) result))
+      (should-not (string-match-p " -> " result)))))
+
+(gptel-agent-test-deftest-glob gptel-agent-test-glob-notices-no-match
+  "Test that a non-matching pattern returns an explicit notice."
+  (gptel-agent-test-with-temp-dir
+    (gptel-agent-test-glob-fixture)
+    (let ((result (gptel-agent-test-glob-invoke "zzznomatch")))
+      (should (string-match-p "No files matching" result)))))
+
+(gptel-agent-test-deftest-glob gptel-agent-test-glob-rejects-invalid-depth
+  "Test that a non-positive or non-numeric depth signals an error."
+  (gptel-agent-test-with-temp-dir
+    (gptel-agent-test-glob-fixture)
+    (should-error (gptel-agent-test-glob-invoke "*.txt" 0) :type 'error)
+    (should-error (gptel-agent-test-glob-invoke "*.txt" -1) :type 'error)
+    (should-error (gptel-agent-test-glob-invoke "*.txt" "nonsense") :type 'error)))
+
+(gptel-agent-test-deftest-glob gptel-agent-test-glob-depth-as-string
+  "Test that a string depth is accepted and limits recursion."
+  (gptel-agent-test-with-temp-dir
+    (gptel-agent-test-glob-fixture)
+    (let ((result (gptel-agent-test-glob-invoke "*.txt" "1")))
+      (should (string-match-p (regexp-quote (expand-file-name "a.txt")) result))
+      (should-not (string-match-p "deep\.txt" result)))))
+
+(gptel-agent-test-deftest-glob gptel-agent-test-glob-path-is-file
+  "Test that passing a file as the search path signals an error."
+  (gptel-agent-test-with-temp-dir
+    (gptel-agent-test-glob-fixture)
+    (should-error (gptel-agent-test-glob-invoke
+                   "*" nil (expand-file-name "a.txt")) :type 'error)))
+
+(gptel-agent-test-deftest-glob gptel-agent-test-glob-warns-on-unreadable-dir
+  "Test that unreadable directories produce a warning instead of silence."
+  (skip-unless (not (zerop (user-uid))))
+  (gptel-agent-test-with-temp-dir
+    (gptel-agent-test-glob-fixture)
+    (make-directory "locked")
+    (write-region "" nil (expand-file-name "locked/x.txt"))
+    (set-file-modes "locked" #o000)
+    (unwind-protect
+        (let ((result (gptel-agent-test-glob-invoke "*.txt")))
+          (should (string-match-p "Glob warning" result))
+          (should (string-match-p "locked" result))
+          (should (string-match-p (regexp-quote (expand-file-name "a.txt")) result)))
+      (set-file-modes "locked" #o755))))
+
 (ert-deftest gptel-agent-test-glob-branches-agree ()
   "Test that the tree and find branches return the same file set."
   (skip-unless (and (executable-find "tree") (executable-find "find")))
