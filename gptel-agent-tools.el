@@ -1767,57 +1767,81 @@ MAIN-CB is the main callback to return a value to the main loop.
 AGENT-TYPE is the name of the agent.
 DESCRIPTION is a short description of the task.
 PROMPT is the detailed prompt instructing the agent on what is required."
-  (gptel-with-preset
-      (nconc (list :include-reasoning nil
-                   :use-tools t
-                   :context nil)       ;Can be overriden by agent
-              (and gptel-agent-preset
-                   (copy-sequence
-                    (cl-etypecase gptel-agent-preset
-                      (symbol (gptel-get-preset gptel-agent-preset))
-                      (plist gptel-agent-preset))))
-              (cdr (assoc agent-type gptel-agent--agents)))
-    (let* ((info (gptel-fsm-info gptel--fsm-last))
-           (where (or (plist-get info :tracking-marker)
-                      (plist-get info :position)))
-           (partial (format "%s result for task: %s\n\n"
-                            (capitalize agent-type) description)))
-      (gptel--update-status " Calling Agent..." 'font-lock-escape-face)
-      (gptel-request prompt
-        :context (gptel-agent--task-overlay where agent-type description)
-        :fsm (gptel-make-fsm :table gptel-send--transitions
-                             :handlers gptel-agent-request--handlers)
-        :transforms (list #'gptel--transform-add-context)
-        :callback
-        (lambda (resp info)
-          (let ((ov (plist-get info :context)))
-            (pcase resp
-              ('nil
-               (delete-overlay ov)
-               (funcall main-cb
-                        (format "Error: Task %s could not finish task \"%s\". \
+  (let* ((delivered nil)               ;Has MAIN-CB been run?
+         (overlay nil)
+         (fsm (gptel-make-fsm :table gptel-send--transitions
+                              :handlers gptel-agent-request--handlers))
+         (partial (format "%s result for task: %s\n\n"
+                          (capitalize agent-type) description)))
+    (cl-labels
+        ((finish
+          (&optional error)
+          "Deliver this task's result to MAIN-CB, exactly once.
 
-Error details: %S"
-                                agent-type description (plist-get info :error))))
-              (`(tool-call . ,calls)
-               (unless (plist-get info :tracking-marker)
-                 (plist-put info :tracking-marker where))
-               (gptel--display-tool-calls calls info))
-              ((pred stringp)
-               (setq partial (concat partial resp))
-               ;; If tool use is pending, the agent isn't done, so we just
-               ;; accumulate output without printing it.  We print at the end.
-               (unless (plist-get info :tool-use)
-                 (delete-overlay ov)
-                 (when-let* ((transformer (plist-get info :transformer)))
-                   (setq partial (funcall transformer partial)))
-                 (funcall main-cb partial)))
-              ('abort
-               (delete-overlay ov)
-               (funcall main-cb
-                        (format "Error: Task \"%s\" was aborted by the user. \
-%s could not finish."
-                                description agent-type))))))))))
+ERROR, if non-nil, is a string explaining why there is no result; it is
+delivered as an error result instead of the accumulated text.  The task
+overlay is removed on every call."
+          (unless delivered
+            (setq delivered t)
+            (when (overlayp overlay) (delete-overlay overlay))
+            (if error
+                (funcall main-cb
+                         (format "Error: %s task \"%s\" did not complete: %s
+Retry with a narrower task, or do this work yourself."
+                                 (capitalize agent-type) description error))
+              (let ((result partial))
+                (when-let* ((info (gptel-fsm-info fsm))
+                            (transformer (plist-get info :transformer)))
+                  (setq result (funcall transformer result)))
+                (funcall main-cb result))))))
+      (gptel-with-preset
+          (nconc (list :include-reasoning nil
+                       :use-tools t
+                       :context nil) ;Can be overriden by agent
+                  (and gptel-agent-preset
+                       (copy-sequence
+                        (cl-etypecase gptel-agent-preset
+                          (symbol (gptel-get-preset gptel-agent-preset))
+                          (plist gptel-agent-preset))))
+                  (cdr (assoc agent-type gptel-agent--agents)))
+        (let* ((info (gptel-fsm-info gptel--fsm-last))
+               (where (or (plist-get info :tracking-marker)
+                          (plist-get info :position))))
+          (gptel--update-status " Calling Agent..." 'font-lock-escape-face)
+          (setq overlay (gptel-agent--task-overlay where agent-type description))
+          (gptel-request prompt
+            :context overlay
+            :fsm fsm
+            :transforms (list #'gptel--transform-add-context)
+            :callback
+            (lambda (resp info)
+              (pcase resp
+                ('nil                    ;The request failed
+                 (finish (format "the request ended with an error: %S"
+                                 (plist-get info :error))))
+                (`(tool-call . ,calls)
+                 (unless (plist-get info :tracking-marker)
+                   (plist-put info :tracking-marker where))
+                 (gptel--display-tool-calls calls info))
+                ('t                      ;Stream finished, deliver what we have
+                 (unless (plist-get info :tool-use) (finish)))
+                ((or `(reasoning . ,_) `(tool-result . ,_))
+                 nil)                   ;Not part of the task's result
+                ('abort
+                 (finish "the task was aborted by the user"))
+                ((pred stringp)
+                 (setq partial (concat partial resp))
+                 ;; A streamed response arrives in chunks and this callback
+                 ;; runs for each one, so only deliver once gptel reports the
+                 ;; end of the stream (RESP is t).  Either way, don't deliver
+                 ;; while tool calls are pending: the agent isn't done.
+                 (unless (or (plist-get info :stream)
+                             (plist-get info :tool-use))
+                   (finish))))))
+          ;; Let the terminal FSM handlers deliver the result when the
+          ;; request dies without giving the callback a chance to.
+          (setf (gptel-fsm-info fsm)
+                (plist-put (gptel-fsm-info fsm) :agent-finish #'finish)))))))
 
 ;;; Register tool call preview functions
 
