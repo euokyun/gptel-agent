@@ -87,6 +87,25 @@
 
 ** Notable bug fixes
 
+- The tool limits are no longer ad hoc.  ~WebSearch~ and ~WebFetch~
+  declare ~:timeout 30~ (the number their own URL timer was already
+  using), the ~Agent~ tool declares ~:timeout~ as a function returning
+  ~gptel-agent-task-timeout~ plus a minute, so that its own watchdog
+  still fires first and customizing that option takes effect for the
+  next call, and the ~Glob~ and ~Grep~ preview limit now follows
+  ~gptel-tool-max-result-chars~ instead of a hardcoded 20000 characters.
+  ~Bash~ declares ~:timeout~ of 120 seconds, so a command that hangs
+  is caught in two minutes rather than in gptel's default ten, and a
+  stale comment describing another client's 2/10 minute limits is gone.
+  The model can raise the limit for a single call, see below.
+
+- ~Bash~ commands are now stopped when gptel gives up on them.  The tool
+  declares ~:cancel #'gptel-agent--cancel-bash~, so a command that
+  outlives the per-call timeout -- or whose request is aborted -- is
+  killed along with its output buffer, instead of running on in the
+  background with nobody to read the result.  This needs gptel's
+  ~:cancel~ support.
+
 - The ~Glob~ tool was reworked.  It now
   - returns only regular files, so directory entries and the ~tree~
     report footer no longer leak into the results,

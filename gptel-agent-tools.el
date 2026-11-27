@@ -286,8 +286,11 @@ Inspect with file(1), strings(1), xxd(1), base64(1)]"
 ;; The command will be executed in the current working directory. Output is
 ;; returned as a string. Long outputs should be filtered/limited using pipes."
 
-;; - Can run commands in background with `run_in_background: true`
-;; - Default timeout is 2 minutes (120000ms), max is 10 minutes
+;; (The stale note that used to sit here, about a 2 minute default timeout and
+;; a 10 minute maximum, described another client's Bash tool: nothing ever
+;; implemented it.  The limits now come from gptel: this tool declares
+;; `gptel-agent--bash-timeout' as its `:timeout', which the model can adjust per
+;; call, and `gptel-tool-max-result-chars' bounds the output length.)
 
 (defun gptel-agent--eval-elisp-preview-setup (arg-values _info)
   "Setup preview overlay for Elisp evaluation tool call.
@@ -326,6 +329,32 @@ ARG-VALUES is the list of arguments for the tool call."
      inner-from (1- (point)) 'font-lock-face (gptel-agent--block-bg))
     (gptel-agent--confirm-overlay from (point) t)))
 
+(defconst gptel-agent--bash-timeout 120
+  "Seconds to allow a Bash command to run.
+
+This is the limit the \"Bash\" tool declares as its `:timeout'.  It is
+lower than gptel's default (`gptel-tool-timeout', ten minutes) because
+a command that is still running after two minutes is usually a
+mistake: something waiting for input, a server that was started
+instead of tested, or a search over the whole filesystem.  The model
+sees the limit in the tool's schema and can raise or lower it for a
+single call with the `timeout' argument, which is what a genuinely
+long build should do.
+
+The tool also declares `:cancel', so the command is killed when gptel
+abandons the call, rather than left running with nobody to read its
+output.")
+
+(defun gptel-agent--cancel-bash (process)
+  "Stop the command run by the \"Bash\" tool.
+PROCESS is what `gptel-agent--execute-bash' returned.  gptel calls
+this when it abandons the call, because it timed out or because its
+request ended: the command is killed and its output discarded, which
+is the point -- a command that took too long should not keep running
+in the background."
+  (when (processp process)
+    (delete-process process)))
+
 (defun gptel-agent--execute-bash (callback command)
   "Execute COMMAND asynchronously in bash and call CALLBACK with output.
 
@@ -363,13 +392,22 @@ COMMAND is the bash command string to execute."
 
 ;;; Web tools
 
+(defconst gptel-agent--fetch-timeout 30
+  "Seconds to allow a WebSearch or WebFetch request to run.
+
+This is the limit the \"WebSearch\" and \"WebFetch\" tools declare as
+their `:timeout', so the model sees it and can lower it per call, and
+so that gptel abandons the call.  The timer below enforces it as well:
+unlike gptel's own per-call timeout, it can also kill the URL retrieval
+process and its buffer, which gptel knows nothing about.")
+
 (defun gptel-agent--fetch-with-timeout (url url-cb tool-cb failed-msg &rest args)
   "Fetch URL and call URL-CB in the result buffer.
 
 Call TOOL-CB if there is an error or a timeout.  TOOL-CB and ARGS are
 passed to URL-CB.  FAILED-MSG is a fragment used for messaging.  Handles
 cleanup."
-  (let* ((timeout 30) timer done
+  (let* ((timeout gptel-agent--fetch-timeout) timer done
          (inherit-process-coding-system t)
          (url-request-noninteractive t)
          (proc-buffer
@@ -1077,16 +1115,34 @@ PATH, FILENAME, and CONTENT must all be strings."
       (error "Error: Could not write file %s:\n%S" path errdata))))
 
 ;;;; Find files using regexes
-(defun gptel-agent--truncate-buffer (prefix &optional max-lines)
-  "Truncate the current buffer if it exceeds 20000 chars.
+(defconst gptel-agent--truncate-buffer-fallback 20000
+  "Characters above which `gptel-agent--truncate-buffer' truncates.
+
+The limit is taken from `gptel-tool-max-result-chars' when that is set
+to a positive number, which is the limit gptel truncates the tool
+result at anyway, so that this preview and gptel's own truncation do
+not disagree.  This value is used when the user has disabled that
+limit, since keeping the full output in a file is still useful.")
+
+(defun gptel-agent--truncate-buffer (prefix &optional max-lines max-chars)
+  "Truncate the current buffer if it exceeds MAX-CHARS characters.
 
 Save the full content to a temporary file and replace the buffer
-with a truncated preview when the size limit is exceeded.
+with a truncated preview when the size limit is exceeded.  The point
+of the preview is that gptel truncates the tool result: the full output
+stays reachable in the file, which the preview names.
 
 PREFIX is a string identifier for the temporary file name.
-MAX-LINES is the number of lines to keep, defaulting to 50."
+MAX-LINES is the number of lines to keep, defaulting to 50.
+MAX-CHARS defaults to `gptel-tool-max-result-chars', or to
+`gptel-agent--truncate-buffer-fallback' when that limit is off."
   ;; Too large - save to temp file and return truncated info
-  (when (> (buffer-size) 20000)
+  (when (> (buffer-size)
+           (or max-chars
+               (and (numberp gptel-tool-max-result-chars)
+                    (> gptel-tool-max-result-chars 0)
+                    gptel-tool-max-result-chars)
+               gptel-agent--truncate-buffer-fallback))
     (let* ((max-lines (or max-lines 50))
            (temp-file (make-nearby-temp-file
                        (format "gptel-agent-%s-%s" prefix
@@ -2025,6 +2081,8 @@ Example: 'ls -la | head -20' or 'grep -i error app.log | tail -50'"))
  :category "gptel-agent"
  :confirm t
  :include t
+ :timeout gptel-agent--bash-timeout
+ :cancel #'gptel-agent--cancel-bash
  :async t)
 
 (gptel-make-tool
@@ -2096,12 +2154,13 @@ If required, consider using the url as the input to the `Read` tool to get the c
                 :optional t))
  :include t
  :async t
+ :timeout gptel-agent--fetch-timeout
  :category "gptel-agent")
 
 (gptel-make-tool
  :function #'gptel-agent--read-url
  :name "WebFetch"
- :description "Fetch and read the contents of a URL.
+ :description (format "Fetch and read the contents of a URL.
 
 - Returns the text of the URL (not HTML) formatted for reading.
 - For YouTube video URLs, returns the video description and transcript
@@ -2109,12 +2168,14 @@ If required, consider using the url as the input to the `Read` tool to get the c
   YouTube URLs.
 - If the URL serves binary content, returns an error with instructions
   to inspect it via the Bash tool instead.
-- Request times out after 30 seconds."
+- The request times out after %d seconds by default; pass a smaller
+  `timeout` to give up sooner." gptel-agent--fetch-timeout)
  :args '(( :name "url"
            :type "string"
            :description "The URL to read"))
  :async t
  :include t
+ :timeout gptel-agent--fetch-timeout
  :category "gptel-agent")
 
 (gptel-make-tool
@@ -2408,7 +2469,15 @@ Should include exactly what information the agent should return."))
  :category "gptel-agent"
  :async t
  :confirm t
- :include t)
+ :include t
+ ;; The sub-agent runs a whole request chain, and its own watchdog
+ ;; (`gptel-agent-task-timeout') aborts that request, so gptel's per-call
+ ;; timeout is set slightly beyond it: the watchdog stays authoritative, and
+ ;; gptel's limit only matters if it somehow fails to fire.  Both are read
+ ;; per call, so customizing the option takes effect for the next call.
+ :timeout (lambda ()
+            (when gptel-agent-task-timeout
+              (+ 60 gptel-agent-task-timeout))))
 
 (provide 'gptel-agent-tools)
 ;;; gptel-agent-tools.el ends here
