@@ -87,6 +87,18 @@
 
 ** Notable bug fixes
 
+- Reading a Markdown agent definition without ~yaml.el~ installed used
+  to fail inside the frontmatter parser with a bare ~file-missing~ for
+  the library, naming neither the file that was being read nor what to
+  install.  The parser now says so, and says which agent file it was
+  reading and how to get around it:
+
+  #+begin_src
+  gptel-agent: cannot read .../agents/researcher.md: the yaml.el library
+  it needs for Markdown frontmatter is not installed.  Install yaml.el
+  (a dependency of gptel-agent), or define the agent in an Org file instead
+  #+end_src
+
 - The tool limits are no longer ad hoc.  ~WebSearch~ and ~WebFetch~
   declare ~:timeout 30~ (the number their own URL timer was already
   using), the ~Agent~ tool declares ~:timeout~ as a function returning

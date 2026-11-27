@@ -351,11 +351,21 @@ Returns a plist with:
   after frontmatter (with templates expanded)
 
 Signals an error if:
+- The yaml.el library is not installed (the frontmatter is YAML)
 - The frontmatter block is malformed (opening without closing delimiter)
 - A key in the frontmatter is not allowed by the validator"
   (unless validator
     (setq validator #'gptel-agent-validator-default))
-  (require 'yaml)
+  ;; yaml.el is a declared dependency of gptel-agent, but it is loaded here,
+  ;; lazily, only by the Markdown frontmatter parser.  When it is missing, a
+  ;; bare `require' reports a failure to find a file from inside this function,
+  ;; which says nothing about what to install or which file was being read, so
+  ;; report it in terms the user can act on.
+  (unless (require 'yaml nil t)
+    (user-error "gptel-agent: cannot read %s: the yaml.el library it needs for \
+Markdown frontmatter is not installed.  Install yaml.el (a dependency of \
+gptel-agent), or define the agent in an Org file instead"
+                file-path))
 
   (with-temp-buffer
     (insert-file-contents file-path)
